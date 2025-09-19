@@ -53,7 +53,17 @@ app.use(errorHandler);
 const server = createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
-// Helpers de sesiones/mensajes
+/** ===================== SESIONES (WS/HTTP) =====================
+ *  Mantenemos un mapa en memoria: (publicId|sid) -> sessionId (DB)
+ *  Esto permite que si el widget se reconecta (misma pestaña, mismo sid),
+ *  RE-USEMOS la misma sesión en la base de datos (ChatSession).
+ */
+const sessionsByKey = new Map(); // key: `${publicId}|${sid}` -> value: sessionId (string)
+function keyOf(publicId, sid) {
+  return `${publicId}|${sid}`;
+}
+
+// Helpers de sesiones/mensajes (DB)
 async function startSession(bot, meta = {}) {
   return prisma.chatSession.create({
     data: {
@@ -83,21 +93,20 @@ async function endSession(sessionId) {
   });
 }
 async function getHistory(sessionId, limit = 20) {
-  // historial en orden ascendente
   const rows = await prisma.chatMessage.findMany({
     where: { sessionId },
     orderBy: { createdAt: "asc" },
     take: limit,
     select: { role: true, content: true },
   });
-  // Mapea a formato OpenAI
-  return rows.map(r => ({ role: r.role, content: r.content }));
+  return rows.map((r) => ({ role: r.role, content: r.content }));
 }
 
-// Upgrade de WS: /ws/chat/:publicId
+// Upgrade de WS: /ws/chat/:publicId?sid=...
 server.on("upgrade", async (req, socket, head) => {
   try {
-    const { pathname } = url.parse(req.url, true);
+    const parsed = url.parse(req.url, true);
+    const { pathname, query } = parsed || {};
     const parts = (pathname || "").split("/").filter(Boolean); // ["ws","chat","<publicId>"]
     if (parts[0] !== "ws" || parts[1] !== "chat" || !parts[2]) {
       socket.destroy();
@@ -105,6 +114,12 @@ server.on("upgrade", async (req, socket, head) => {
     }
 
     const publicId = parts[2];
+    const sid = String(query?.sid || ""); // <-- sid requerido
+    if (!sid) {
+      socket.destroy();
+      return;
+    }
+
     const origin = String(req.headers.origin || req.headers.referer || "").replace(/\/$/, "");
 
     // Valida origen + learn_once
@@ -119,31 +134,33 @@ server.on("upgrade", async (req, socket, head) => {
     // const sub = await prisma.subscription.findFirst({ where: { userId: bot.userId, status: "active" } });
     // if (!sub) { socket.destroy(); return; }
 
+    // Pasamos publicId y sid al handler WS vía "ctx"
     wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req, { bot });
+      wss.emit("connection", ws, req, { bot, publicId, sid });
     });
   } catch {
     socket.destroy();
   }
 });
 
-// Conexión WS: streaming con HISTORIAL y CIERRE por inactividad/cierre
+// Conexión WS: streaming con HISTORIAL y reuso de sesión por (publicId|sid)
 wss.on("connection", (ws, req, ctx) => {
   const bot = ctx.bot;
+  const publicId = ctx.publicId;
+  const sid = ctx.sid;
+
   const ip = (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").toString();
   const ua = (req.headers["user-agent"] || "").toString();
 
-  let sessionId = null;
-  let idleTimer = null;
+  const mapKey = keyOf(publicId, sid);
+  let sessionId = sessionsByKey.get(mapKey) || null;
 
+  let idleTimer = null;
   const resetIdle = () => {
     if (idleTimer) clearTimeout(idleTimer);
-    // cierra por inactividad (2 min)
+    // Cierra el socket por inactividad (2 min), pero NO cierres la sesión en DB
+    // para permitir reuso (misma pestaña + mismo sid).
     idleTimer = setTimeout(async () => {
-      if (sessionId) {
-        await endSession(sessionId).catch(() => {});
-        sessionId = null;
-      }
       try { ws.close(); } catch {}
     }, 2 * 60 * 1000);
   };
@@ -157,12 +174,15 @@ wss.on("connection", (ws, req, ctx) => {
       // Espera { type: "user_msg", text: "..." }
       if (msg.type !== "user_msg" || !msg.text) return;
 
-      // 1) Abrir sesión si no existe
+      // 1) Buscar/crear sesión DB una vez por (publicId|sid)
       if (!sessionId) {
-        const s = await startSession(bot, { ip, ua });
+        const s = await startSession(bot, { ip, ua, sid, publicId });
         sessionId = s.id;
-        // envía el id al cliente para que lo sepa (opcional)
-        ws.send(JSON.stringify({ type: "session", id: sessionId }));
+        sessionsByKey.set(mapKey, sessionId);
+        // Envía el id al cliente (opcional)
+        try {
+          ws.send(JSON.stringify({ type: "session", id: sessionId, sid }));
+        } catch {}
       }
 
       // 2) Guardar mensaje del usuario
@@ -173,14 +193,14 @@ wss.on("connection", (ws, req, ctx) => {
       const history = await getHistory(sessionId, 20); // hasta 20 previos
       const messages = [
         { role: "system", content: bot.prompt },
-        ...history,                             // incluye turnos previos
-        { role: "user", content: userText },    // turno actual
+        ...history, // incluye turnos previos (ya trae el user recién guardado)
       ];
 
       // 4) Llamar a OpenAI en stream
       const apiKey = bot.openaiKeyEncrypted ? decrypt(bot.openaiKeyEncrypted) : process.env.OPENAI_API_KEY;
       const client = new OpenAI({ apiKey });
 
+      const tStart = Date.now();
       const stream = await client.chat.completions.create({
         model: bot.model || "gpt-4o-mini",
         temperature: bot.temperature ?? 0.7,
@@ -192,7 +212,6 @@ wss.on("connection", (ws, req, ctx) => {
       ws.send(JSON.stringify({ type: "bot_start" }));
 
       let assistantText = "";
-      const tStart = Date.now();
       let tFirstChunk = null;
 
       for await (const part of stream) {
@@ -206,15 +225,12 @@ wss.on("connection", (ws, req, ctx) => {
 
       const latencyMs = tFirstChunk ? tFirstChunk - tStart : null;
 
-      // 4) Guardar respuesta del bot...
-await addMessage(sessionId, "assistant", assistantText, { latencyMs });
+      // 5) Guardar respuesta del bot
+      await addMessage(sessionId, "assistant", assistantText, { latencyMs });
 
-ws.send(JSON.stringify({ type: "bot_done" }));
-      //await addMessage(sessionId, "assistant", assistantText, { latencyMs });
-      //ws.send(JSON.stringify({ type: "bot_done" }));
+      ws.send(JSON.stringify({ type: "bot_done" }));
 
-
-      // NOTA: **NO** cerramos la sesión aquí. Se cierra al cerrar el WS o por inactividad.
+      // Nota: NO cerramos la sesión aquí. Queda viva para reuso por el mismo sid.
     } catch (e) {
       try {
         ws.send(JSON.stringify({ type: "bot_error", error: "stream_failed" }));
@@ -224,10 +240,8 @@ ws.send(JSON.stringify({ type: "bot_done" }));
 
   ws.on("close", async () => {
     if (idleTimer) clearTimeout(idleTimer);
-    if (sessionId) {
-     // await endSession(sessionId).catch(() => {});
-      //sessionId = null;
-    }
+    // No cerramos la sesión en DB aquí para permitir reuso por el mismo sid.
+    // Si quieres marcar "endedAt" en algún momento, podemos implementar un GC por inactividad prolongada.
   });
 });
 

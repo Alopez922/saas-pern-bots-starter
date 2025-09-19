@@ -1,8 +1,11 @@
-// SINGLETON widget – un solo WS por bot y por página
+// SINGLETON widget – un solo WS por bot y por página + sessionId estable (sid)
+type ChatSocket = WebSocket & { __isBotSocket?: true };
+
 (function () {
   // Evita inicializar dos veces si el script se carga/inyecta repetido
-  if ((window as any).__BOT_WIDGET_INIT__) return;
-  (window as any).__BOT_WIDGET_INIT__ = true;
+  const W = window as any;
+  if (W.__BOT_WIDGET_INIT__) return;
+  W.__BOT_WIDGET_INIT__ = true;
 
   // Localiza la etiqueta <script data-bot data-server>
   let script = document.currentScript as HTMLScriptElement | null;
@@ -20,20 +23,23 @@
   }
   if (!script) return;
 
-  const API = script.getAttribute('data-server')!.replace(/\/$/, ''); // sin "/"
-  const BOT = script.getAttribute('data-bot')!;
+  const API = (script.getAttribute('data-server') || '').replace(/\/+$/,''); // sin "/"
+  const BOT = script.getAttribute('data-bot') || '';
 
-  // ——— Estado global por si hay varios widgets/bots en la misma página ———
-  const globalSockets = ((window as any).__botSockets ||= new Map<
-    string,
-    {
-      ws: WebSocket | null;
-      queue: string[];
-      connecting: boolean;
-      lineEl: HTMLDivElement | null;
-      started: boolean;
-    }
-  >());
+  if (!API || !BOT) return; // faltan datos para funcionar
+
+  // ——— Globals para múltiples widgets/bots en la misma página ———
+  // Sockets por bot
+  const globalSockets: Map<string, {
+    ws: ChatSocket | null;
+    queue: string[];
+    connecting: boolean;
+    lineEl: HTMLDivElement | null;
+    started: boolean;
+  }> = (W.__botSockets ||= new Map());
+
+  // Session IDs por bot (persisten por pestaña)
+  const globalSids: Map<string, string> = (W.__botSessionIds ||= new Map());
 
   function getState(botId: string) {
     if (!globalSockets.has(botId)) {
@@ -46,6 +52,17 @@
       });
     }
     return globalSockets.get(botId)!;
+  }
+
+  function getSid(botId: string) {
+    if (!globalSids.has(botId)) {
+      const sid =
+        (crypto && typeof crypto.randomUUID === 'function')
+          ? crypto.randomUUID()
+          : Math.random().toString(36).slice(2);
+      globalSids.set(botId, sid);
+    }
+    return globalSids.get(botId)!;
   }
 
   // ——— UI mínima ———
@@ -70,36 +87,48 @@
 
   btn.onclick = () => {
     box.style.display = (box.style.display === 'none' ? 'block' : 'none');
+    if (box.style.display === 'block') input.focus();
   };
 
-  // ——— Lógica WS con singleton ———
-  function wsUrl() {
-    return API.replace(/^http(s?):/, 'ws$1:') + `/ws/chat/${BOT}`;
+  // ——— Lógica WS con singleton + sid ———
+  function wsUrl(botId: string) {
+    const sid = encodeURIComponent(getSid(botId));
+    const base = API.replace(/^http(s?):/, 'ws$1:');
+    return `${base}/ws/chat/${encodeURIComponent(botId)}?sid=${sid}`;
   }
 
-  function ensureSocket() {
+  function ensureSocket(): ChatSocket | null {
     const state = getState(BOT);
+
+    // Si ya existe y está abierta, reutilízala
     if (state.ws && state.ws.readyState === WebSocket.OPEN) return state.ws;
-    if (state.connecting) return state.ws; // se está abriendo
+
+    // Si ya se está conectando, devuelve la referencia actual
+    if (state.connecting && state.ws) return state.ws;
 
     state.connecting = true;
     state.started = false;
     state.lineEl = null;
 
-    const ws = new WebSocket(wsUrl());
+    const ws = new WebSocket(wsUrl(BOT)) as ChatSocket;
+    ws.__isBotSocket = true;
     state.ws = ws;
 
     ws.onopen = () => {
       state.connecting = false;
-      // drena cola acumulada mientras “conectaba”
+      // Drena cola acumulada mientras “conectaba”
       for (const text of state.queue.splice(0)) {
-        ws.send(JSON.stringify({ type: 'user_msg', text }));
+        try {
+          ws.send(JSON.stringify({ type: 'user_msg', text, sid: getSid(BOT) }));
+        } catch {
+          // Si falla el envío, que lo resuelva fallback en el próximo intento
+        }
       }
     };
 
     ws.onmessage = (ev) => {
       try {
-        const data = JSON.parse(ev.data);
+        const data = JSON.parse(String(ev.data));
         if (data.type === 'bot_start') {
           state.started = true;
           state.lineEl = document.createElement('div');
@@ -133,7 +162,7 @@
     };
 
     ws.onclose = () => {
-      // si se cerró, marcamos para poder re-conectar en el próximo envío
+      // si se cerró, permitimos re-conexión en el próximo envío
       state.ws = null;
       state.connecting = false;
       state.started = false;
@@ -143,34 +172,47 @@
     return ws;
   }
 
-  async function sendViaHttp(text: string) {
-    try {
-      const res = await fetch(`${API}/api/chat/${BOT}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text })
-      });
-      const data = await res.json();
-      log.innerHTML += `<div><b>Bot:</b> ${data.reply || '...'}</div>`;
-      log.scrollTop = log.scrollHeight;
-    } catch {
-      log.innerHTML += `<div><b>Bot:</b> error</div>`;
+ async function sendViaHttp(text: string) {
+  const sid = getSid(BOT);                 // ← Asegura SID
+  const url = `${API}/api/chat/${encodeURIComponent(BOT)}`;
+  const payload = { message: text, sid };  // ← Enviar SID
+
+  // Debug útil para ver en consola del navegador
+  console.log("[widget][POST]", url, payload);
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      console.warn("[widget][POST] non-200", res.status, err);
+      log.innerHTML += `<div><b>Bot:</b> error (${res.status})</div>`;
+      return;
     }
+
+    const data = await res.json();
+    const reply = (data && (data.reply || data.text)) || '...';
+    log.innerHTML += `<div><b>Bot:</b> ${reply}</div>`;
+    log.scrollTop = log.scrollHeight;
+  } catch (e) {
+    console.error("[widget][POST] fetch error", e);
+    log.innerHTML += `<div><b>Bot:</b> error</div>`;
   }
+}
 
-  send.onclick = () => {
-    const text = input.value.trim();
-    if (!text) return;
-    log.innerHTML += `<div><b>Tú:</b> ${text}</div>`;
-    input.value = '';
 
+  function sendMessage(text: string) {
     const state = getState(BOT);
     const ws = ensureSocket();
 
-    // si ya está abierto, manda; si está conectando, encola
+    // Si ya está abierto, manda; si está conectando, encola
     if (ws && ws.readyState === WebSocket.OPEN) {
       try {
-        ws.send(JSON.stringify({ type: 'user_msg', text }));
+        ws.send(JSON.stringify({ type: 'user_msg', text, sid: getSid(BOT) }));
       } catch {
         // si falló el send, intenta HTTP fallback
         sendViaHttp(text);
@@ -181,5 +223,32 @@
       // si por algún motivo no hay ws, usa HTTP como respaldo
       sendViaHttp(text);
     }
+  }
+
+  // ——— Eventos UI ———
+  send.onclick = () => {
+    const text = input.value.trim();
+    if (!text) return;
+    log.innerHTML += `<div><b>Tú:</b> ${text}</div>`;
+    input.value = '';
+    sendMessage(text);
   };
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      send.click();
+    }
+  });
+
+  // Cierra sockets cuando cierras la pestaña (limpieza)
+  window.addEventListener('beforeunload', () => {
+    for (const [key, state] of globalSockets.entries()) {
+      try { state.ws?.close(); } catch {}
+      state.ws = null;
+      state.connecting = false;
+      state.started = false;
+      state.lineEl = null;
+    }
+  });
 })();
