@@ -1,0 +1,9 @@
+{
+  "name": "saas-pern-bots",
+  "private": true,
+  "workspaces": [
+    "app/backend",
+    "app/frontend",
+    "app/widget"
+  ]
+}

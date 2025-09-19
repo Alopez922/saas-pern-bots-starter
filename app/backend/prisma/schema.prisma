@@ -1,0 +1,119 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String?
+  role         String   @default("user")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  subscriptions Subscription[]
+  bots          Bot[]
+}
+
+model Plan {
+  id           String @id @default(cuid())
+  name         String
+  priceCents   Int
+  botsIncluded Int    @default(1)
+  features     Json?
+
+  // Mantengo tu nombre de campo original en mayúscula para no romper nada
+  Subscription Subscription[]
+}
+
+model Subscription {
+  id                   String    @id @default(cuid())
+  userId               String
+  planId               String
+  status               String
+  stripeCustomerId     String?
+  stripeSubscriptionId String?
+  currentPeriodEnd     DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+  plan Plan @relation(fields: [planId], references: [id])
+
+  @@index([userId])
+  @@index([planId])
+}
+
+model Bot {
+  id                 String   @id @default(cuid())
+  userId             String
+  name               String
+  model              String   @default("gpt-4o-mini")
+  prompt             String
+  temperature        Float    @default(0.7)
+  maxTokens          Int?     @default(800)
+  openaiKeyEncrypted String?
+  publicId           String   @unique @default(cuid())
+  allowedOrigins     String[] @default([]) // antes: String
+  n8nWebhookUrl      String?
+  isActive           Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  user      User          @relation(fields: [userId], references: [id])
+  usageLogs UsageLog[]
+  sessions  ChatSession[] // 👈 lado opuesto requerido
+
+  @@index([userId])
+  @@index([publicId])
+}
+
+model ChatSession {
+  id        String    @id @default(cuid())
+  botId     String
+  bot       Bot       @relation(fields: [botId], references: [id], onDelete: Cascade)
+  startedAt DateTime  @default(now())
+  endedAt   DateTime?
+  ip        String?
+  userAgent String?
+  meta      Json?
+
+  messages ChatMessage[]
+
+  @@index([botId, startedAt])
+}
+
+model ChatMessage {
+  id        String      @id @default(cuid())
+  sessionId String
+  session   ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  role      String // "user" | "assistant" | "system" | "tool"
+  content   String
+  createdAt DateTime    @default(now())
+  tokenIn   Int?
+  tokenOut  Int?
+  latencyMs Int?
+
+  @@index([sessionId, createdAt])
+}
+
+model UsageLog {
+  id               String   @id @default(cuid())
+  botId            String
+  userId           String?
+  type             String
+  promptTokens     Int?
+  completionTokens Int?
+  totalTokens      Int?
+  meta             Json?
+  createdAt        DateTime @default(now())
+
+  bot Bot @relation(fields: [botId], references: [id])
+
+  @@index([botId, createdAt])
+}
